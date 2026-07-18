@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airline Booking</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  fieldset { border: 1px solid #ccc7; border-radius: 8px; margin-bottom: 1rem; }
+  label { display: inline-block; margin: .3rem .8rem .3rem 0; }
+  input { padding: .3rem .4rem; width: 8rem; }
+  button { padding: .35rem .9rem; cursor: pointer; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { border: 1px solid #ccc7; padding: .4rem .6rem; text-align: left; font-size: .9rem; }
+  #msg { padding: .5rem; margin: .5rem 0; border-radius: 6px; display: none; }
+  #msg.ok { display: block; background: #d3f5d3; color: #145014; }
+  #msg.err { display: block; background: #f8d2d2; color: #6b1010; }
+  .status-booked { color: green; } .status-cancelled { color: crimson; }
+</style>
+</head>
+<body>
+<h1>✈️ Airline Booking</h1>
+<div id="msg"></div>
+
+<fieldset>
+  <legend>Who are you?</legend>
+  <label>User ID <input id="userId" type="number" value="1" min="1"></label>
+  <button onclick="loadBookings()">My bookings</button>
+</fieldset>
+
+<fieldset>
+  <legend>Search flights</legend>
+  <label>From airport code <input id="from" type="text" placeholder="e.g. MAA"></label>
+  <label>To airport code <input id="to" type="text" placeholder="e.g. BLR"></label>
+  <label>Date <input id="date" type="date"></label>
+  <label>Travellers <input id="travellers" type="number" value="1" min="1"></label>
+  <button onclick="searchFlights()">Search</button>
+</fieldset>
+
+<div id="flights"></div>
+<div id="bookings"></div>
+
+<script>
+const FLIGHTS_API = 'http://localhost:3000/api/v1';
+const BOOKINGS_API = 'http://localhost:4000/api/v1';
+
+const msg = (text, ok) => {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = ok ? 'ok' : 'err';
+};
+
+const explain = (payload) => {
+  const e = payload?.error;
+  return e?.explanation ? [].concat(e.explanation).join(', ') : (payload?.message || 'Something went wrong');
+};
+
+async function searchFlights() {
+  const q = new URLSearchParams();
+  const from = document.getElementById('from').value, to = document.getElementById('to').value;
+  if (from && to) q.set('trips', `${from}-${to}`);
+  const date = document.getElementById('date').value;
+  if (date) q.set('tripDate', date);
+  const travellers = document.getElementById('travellers').value;
+  if (travellers) q.set('travellers', travellers);
+  try {
+    const res = await fetch(`${FLIGHTS_API}/flights?${q}`);
+    const body = await res.json();
+    if (!res.ok) return msg(explain(body), false);
+    renderFlights(body.data);
+  } catch { msg('Flight service is not reachable on :3000', false); }
+}
+
+function renderFlights(flights) {
+  const div = document.getElementById('flights');
+  if (!flights.length) { div.innerHTML = '<p>No flights found.</p>'; return; }
+  div.innerHTML = '<h3>Flights</h3><table><tr><th>ID</th><th>Flight</th><th>Departs</th><th>Arrives</th><th>Price</th><th>Seats left</th><th></th></tr>' +
+    flights.map(f => `<tr>
+      <td>${f.id}</td><td>${f.flightNumber}</td>
+      <td>${new Date(f.departureTime).toLocaleString()}</td>
+      <td>${new Date(f.arrivalTime).toLocaleString()}</td>
+      <td>₹${f.price}</td><td>${f.totalSeats}</td>
+      <td><button onclick="book(${f.id})">Book</button></td>
+    </tr>`).join('') + '</table>';
+}
+
+async function book(flightId) {
+  const userId = +document.getElementById('userId').value;
+  const noOfSeats = +document.getElementById('travellers').value || 1;
+  try {
+    const res = await fetch(`${BOOKINGS_API}/bookings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ flightId, userId, noOfSeats })
+    });
+    const body = await res.json();
+    if (!res.ok) return msg(explain(body), false);
+    msg(`Booking #${body.data.id} created (₹${body.data.totalCost}) — pay within 5 minutes to confirm.`, true);
+    searchFlights(); loadBookings();
+  } catch { msg('Booking service is not reachable on :4000', false); }
+}
+
+async function pay(bookingId, totalCost) {
+  const userId = +document.getElementById('userId').value;
+  try {
+    const res = await fetch(`${BOOKINGS_API}/bookings/payments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-idempotency-key': crypto.randomUUID() },
+      body: JSON.stringify({ bookingId, userId, totalCost })
+    });
+    const body = await res.json();
+    if (!res.ok) return msg(explain(body), false);
+    msg(`Payment successful — booking #${bookingId} confirmed.`, true);
+    loadBookings();
+  } catch { msg('Booking service is not reachable on :4000', false); }
+}
+
+async function cancelBooking(bookingId) {
+  const res = await fetch(`${BOOKINGS_API}/bookings/${bookingId}`, { method: 'DELETE' });
+  const body = await res.json();
+  msg(res.ok ? `Booking #${bookingId} cancelled, seats released.` : explain(body), res.ok);
+  searchFlights(); loadBookings();
+}
+
+async function loadBookings() {
+  const userId = document.getElementById('userId').value;
+  try {
+    const res = await fetch(`${BOOKINGS_API}/bookings?userId=${userId}`);
+    const body = await res.json();
+    if (!res.ok) return msg(explain(body), false);
+    const div = document.getElementById('bookings');
+    if (!body.data.length) { div.innerHTML = '<h3>My bookings</h3><p>None yet.</p>'; return; }
+    div.innerHTML = '<h3>My bookings</h3><table><tr><th>ID</th><th>Flight</th><th>Seats</th><th>Cost</th><th>Status</th><th></th></tr>' +
+      body.data.map(b => `<tr>
+        <td>${b.id}</td><td>${b.flightId}</td><td>${b.noOfSeats}</td><td>₹${b.totalCost}</td>
+        <td class="status-${b.status}">${b.status}</td>
+        <td>${b.status === 'initiated' ? `<button onclick="pay(${b.id}, ${b.totalCost})">Pay</button>
+             <button onclick="cancelBooking(${b.id})">Cancel</button>` : ''}</td>
+      </tr>`).join('') + '</table>';
+  } catch { msg('Booking service is not reachable on :4000', false); }
+}
+
+searchFlights();
+</script>
+</body>
+</html>

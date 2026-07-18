@@ -1,0 +1,12 @@
+const express = require('express');
+
+const { BookingController} = require('../../controllers');
+
+const router = express.Router();
+
+router.post('/',BookingController.createBooking)
+router.post('/payments',BookingController.makePayment)
+router.get('/',BookingController.getBookingsByUser)
+router.delete('/:id',BookingController.cancelBooking)
+
+module.exports=router

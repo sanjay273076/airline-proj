@@ -1,0 +1,114 @@
+AIRLINE BOOKING SYSTEM - COMPLETE FLOW
+=======================================
+
+ARCHITECTURE
+------------
+Two Node.js/Express microservices sharing one Postgres database ("Flights"),
+plus a single-file static frontend.
+
+1. Flights Service   (port 3000, project root)
+   Owns: Cities, Airports, Airplanes, Flights, Seats.
+   Source of truth for flight inventory (seat counts, prices, schedules).
+
+2. Booking Service   (port 4000, Bookings/Flight-Booking-Service)
+   Owns: Bookings. Never touches the Flights table directly - it talks to
+   the Flights service over HTTP (axios), so inventory rules live in one place.
+
+3. Frontend          (frontend/index.html)
+   Plain HTML + vanilla JS. No build step, no framework. Open the file in a
+   browser; it calls both services with fetch(). Both services send CORS
+   headers so this works from a file:// or any origin.
+
+LAYERING (both services follow the same pattern)
+------------------------------------------------
+  routes -> middlewares (validation) -> controllers -> services -> repositories -> models (Sequelize) -> Postgres
+
+  - Controllers only parse HTTP in/out.
+  - Services hold business rules (seat checks, expiry, payment rules).
+  - Repositories hold all DB access (and transactions/locks).
+
+THE BOOKING FLOW, STEP BY STEP
+------------------------------
+1. SEARCH
+   GET /api/v1/flights?trips=MAA-BLR&tripDate=2026-07-25&travellers=2&sort=price_ASC
+   The flight service builds a Sequelize filter from the query string
+   (route pair, price range, date window, minimum available seats) and
+   returns matching flights.
+
+2. CREATE BOOKING (POST /api/v1/bookings  body: {flightId, userId, noOfSeats})
+   Inside a DB transaction the booking service:
+     a. Fetches the flight from the flight service (GET /flights/:id).
+     b. Rejects if noOfSeats > seats remaining.
+     c. Computes totalCost = price * noOfSeats.
+     d. Inserts a Booking row with status = "initiated".
+     e. Calls PATCH /flights/:id/seats on the flight service to decrement
+        the seat count.
+     f. If the seat decrement fails (not enough seats, service down), the
+        transaction rolls back - no orphan booking is left behind.
+   The booking is now a 5-minute hold: seats are reserved but unpaid.
+
+3. CONCURRENCY - WHY WE NEVER OVERSELL
+   The critical section is the seat decrement in the FLIGHT service:
+     - flight-repository.updateRemainingSeats opens a transaction and loads
+       the flight row with SELECT ... FOR UPDATE (transaction.LOCK.UPDATE).
+     - Postgres queues every other transaction that wants the same row.
+     - Inside the lock we re-check "enough seats left?", then decrement,
+       then commit (which releases the lock).
+   So if 15 requests race for the last 10 seats, they are serialized at the
+   row lock; the first 10 see enough seats and win, the last 5 see 0 and get
+   a 400 "Not enough seats available". (Verified: exactly 10/15 concurrent
+   requests succeeded and the seat count landed on 0.)
+
+4. PAYMENT (POST /api/v1/bookings/payments  header: x-idempotency-key)
+   Checks, in order:
+     - Idempotency key not seen before (else 409 "already processed") -
+       protects against double-charging on retries/double-clicks.
+     - Booking exists, is not cancelled, is not already paid.
+     - Booking is younger than 5 minutes; if expired it is cancelled on the
+       spot (seats restored) and payment is refused.
+     - Amount and userId match the booking.
+   On success the booking flips to status = "booked".
+   (Payment gateway itself is mocked - the checks are the real logic.)
+
+5. CANCELLATION (DELETE /api/v1/bookings/:id)
+   In a transaction: PATCH the flight service with dec=false to give the
+   seats back, then set status = "cancelled". Cancelling an already-cancelled
+   booking is a harmless no-op.
+
+6. AUTO-EXPIRY SWEEPER
+   Every 5 minutes the booking service finds bookings still unpaid
+   (status not in [booked, cancelled]) older than 5 minutes and cancels each
+   one through the same cancellation path - so their seats return to the
+   pool automatically. Abandoned checkouts cannot hold inventory forever.
+
+7. VIEW BOOKINGS (GET /api/v1/bookings?userId=N)
+   Returns the user's bookings, newest first. The frontend uses this to show
+   "My bookings" with Pay / Cancel buttons on initiated ones.
+
+ERROR HANDLING
+--------------
+- AppError(message, statusCode) is thrown from services/repositories and the
+  controllers map it straight to the HTTP response, so clients get the real
+  status (400 seat shortage, 404 missing booking, 409 replayed payment,
+  503 flight service unreachable) instead of a blanket 500.
+- When the flight service rejects a call, the booking service forwards the
+  original explanation and status code to the client.
+
+FRONTEND FLOW
+-------------
+index.html -> Search (GET flights) -> Book (POST bookings, shows 5-min notice)
+           -> My bookings (GET bookings?userId) -> Pay (POST payments with a
+              random UUID idempotency key) or Cancel (DELETE) -> lists refresh.
+
+RUNNING IT
+----------
+  createdb Flights                       (once)
+  # flight service
+  cd airline-proj/src && npx sequelize-cli db:migrate
+  cd .. && npm run dev                   (port 3000)
+  # booking service
+  cd Bookings/Flight-Booking-Service/src && npx sequelize-cli db:migrate
+  cd .. && npm run dev                   (port 4000)
+  # frontend
+  open frontend/index.html
+
