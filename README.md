@@ -174,10 +174,32 @@ airline-proj/
 │   ├── models/ · migrations/     #     Sequelize schema
 │   └── config/                   #     env + winston logger
 ├── Bookings/Flight-Booking-Service/
-│   └── src/                      # 🎫  Booking service (same layering)
+│   └── src/                      # 🎫  Booking service
+│       ├── index.js              #     server bootstrap + CORS + expiry sweeper (setInterval)
+│       ├── routes/v1/            #     POST /bookings · /payments · GET · DELETE
+│       ├── controllers/          #     parse request, map AppError → HTTP status
+│       ├── services/
+│       │   └── booking-service.js#     the brains: transactional booking, idempotent
+│       │                         #     payment, 5-min expiry, cancellation w/ seat refund
+│       ├── repositories/
+│       │   └── booking-repository.js # transaction-aware CRUD + expired-booking query
+│       ├── models/ · migrations/ #     Booking schema (status enum: initiated/booked/
+│       │                         #     cancelled/pending)
+│       ├── utils/                #     AppError, response shapes, status enums
+│       └── config/               #     PORT + FLIGHT_SERVICE url + logger
 ├── frontend/index.html           # 🖥️  light UI — search / book / pay / cancel
 └── FLOW.txt                      # 📜  full end-to-end flow walkthrough
 ```
+
+**How a booking request travels through the booking service:**
+
+1. `routes/v1/booking-routes.js` matches `POST /api/v1/bookings`.
+2. `controllers/booking-controller.js` validates the body (`flightId`, `userId`) and does nothing else — controllers never contain business logic.
+3. `services/booking-service.js` opens a **DB transaction**, fetches the flight from the Flights service, checks availability, computes `totalCost`, and asks the Flights service to decrement seats (the row-locked call). Any failure rolls the whole thing back.
+4. `repositories/booking-repository.js` is the only layer that touches the `Bookings` table — every method accepts a `transaction` so the service controls atomicity.
+5. `utils/errors/app-error.js` carries the real status code back up, so the controller returns 400/404/409/503 instead of a blanket 500.
+
+The Flights service mirrors this exact layering — learn one service and you've learned both.
 
 ---
 
